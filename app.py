@@ -16,6 +16,12 @@ from quart import (
     current_app,
 )
 
+# CORS opcional: si no tienes quart-cors instalado, no pasa nada
+try:
+    from quart_cors import cors
+except ImportError:
+    cors = None
+
 from openai import AsyncAzureOpenAI
 from azure.identity.aio import (
     DefaultAzureCredential,
@@ -46,6 +52,10 @@ cosmos_db_ready = asyncio.Event()
 
 def create_app():
     app = Quart(__name__)
+    # CORS básico para pruebas (restringe luego a tu dominio)
+    if cors:
+        app = cors(app, allow_origin="*")
+
     app.register_blueprint(bp)
     app.config["TEMPLATES_AUTO_RELOAD"] = True
 
@@ -92,6 +102,17 @@ logging.basicConfig(level=logging.DEBUG if DEBUG else logging.INFO)
 
 USER_AGENT = "GitHubSampleWebApp/AsyncAzureOpenAI/1.0.0"
 
+# Ruta de depuración: lista las rutas disponibles
+@bp.route("/__routes")
+async def list_routes():
+    routes = []
+    # Nota: app es el objeto global creado al final del archivo
+    for rule in app.url_map.iter_rules():
+        methods = sorted(m for m in rule.methods if m not in ("HEAD", "OPTIONS"))
+        routes.append({"rule": str(rule), "methods": methods})
+    return jsonify(routes), 200
+
+
 # ---------------------------------------------------------------------
 # Frontend settings (expuestos al FE)
 # ---------------------------------------------------------------------
@@ -136,7 +157,7 @@ async def init_openai_client():
                 f"'{MINIMUM_SUPPORTED_AZURE_OPENAI_PREVIEW_API_VERSION}'"
             )
 
-        # Endpoint
+        # Endpoint (acepta AZURE_OPENAI_ENDPOINT o AZURE_OPENAI_RESOURCE)
         if (
             not app_settings.azure_openai.endpoint and
             not app_settings.azure_openai.resource
@@ -154,7 +175,6 @@ async def init_openai_client():
         ad_token_provider = None
         if not aoai_api_key:
             logging.debug("No AZURE_OPENAI_KEY found, using Azure Entra ID auth")
-            # Creamos el token provider con credencial administrada
             async with DefaultAzureCredential() as credential:
                 ad_token_provider = get_bearer_token_provider(
                     credential,
@@ -215,7 +235,6 @@ async def openai_remote_azure_function_call(function_name, function_args):
     if app_settings.azure_openai.function_call_azure_functions_enabled is not True:
         return
 
-    # Soporta tanto *_tool_* como *_tools_* en settings (robustez)
     base_url = getattr(
         app_settings.azure_openai,
         "function_call_azure_functions_tool_base_url",
@@ -313,7 +332,6 @@ def prepare_model_args(request_body, request_headers):
                 try:
                     m["context"] = json.loads(message["context"])
                 except Exception:
-                    # si no es JSON válido, lo ignoramos
                     pass
             messages.append(m)
 
@@ -423,7 +441,6 @@ async def process_function_call(response):
 
     if response_message.tool_calls:
         for tool_call in response_message.tool_calls:
-            # Solo ejecutamos funciones declaradas en tools metadata
             if tool_call.function.name not in azure_openai_available_tools:
                 continue
 
@@ -456,7 +473,6 @@ async def process_function_call(response):
 # Chat: envío base
 # ---------------------------------------------------------------------
 async def send_chat_request(request_body, request_headers):
-    # Filtra mensajes 'tool' (no válidos en chat/completions)
     request_body["messages"] = [
         m for m in request_body.get("messages", []) if m.get("role") != "tool"
     ]
@@ -521,7 +537,6 @@ async def process_function_call_stream(completionChunk, state, request_body, req
 
     delta = completionChunk.choices[0].delta
 
-    # En curso
     if delta.tool_calls and state.streaming_state in ["INITIAL", "STREAMING"]:
         state.streaming_state = "STREAMING"
         for tc in delta.tool_calls:
@@ -540,7 +555,6 @@ async def process_function_call_stream(completionChunk, state, request_body, req
             else:
                 state.tool_arguments_stream += tc.function.arguments or ""
 
-    # Fin del stream de tool_calls
     elif delta.tool_calls is None and state.streaming_state == "STREAMING":
         state.current_tool_call["tool_arguments"] = state.tool_arguments_stream
         state.tool_calls.append(state.current_tool_call)
@@ -619,12 +633,37 @@ async def conversation_internal(request_body, request_headers):
 # ---------------------------------------------------------------------
 # Rutas HTTP
 # ---------------------------------------------------------------------
+# Health/Status (root)
+@bp.route("/health", methods=["GET"])
+async def health_root():
+    return jsonify({"status": "ok", "scope": "root"}), 200
+
+@bp.route("/status", methods=["GET"])
+async def status_root():
+    return jsonify({"app": "InviktaChatDemo", "scope": "root"}), 200
+
+# Health/Status (api)
+@bp.route("/api/health", methods=["GET"])
+async def health_api():
+    return jsonify({"status": "ok", "scope": "api"}), 200
+
+@bp.route("/api/status", methods=["GET"])
+async def status_api():
+    return jsonify({"app": "InviktaChatDemo", "scope": "api"}), 200
+
+
+# Conversación (ruta original)
 @bp.route("/conversation", methods=["POST"])
 async def conversation():
     if not request.is_json:
         return jsonify({"error": "request must be json"}), 415
     request_json = await request.get_json()
     return await conversation_internal(request_json, request.headers)
+
+# Conversación (alias bajo /api)
+@bp.route("/api/conversation", methods=["POST"])
+async def conversation_api():
+    return await conversation()
 
 
 @bp.route("/frontend_settings", methods=["GET"])
@@ -634,6 +673,25 @@ def get_frontend_settings():
     except Exception:
         logging.exception("Exception in /frontend_settings")
         return jsonify({"error": "internal error"}), 500
+
+# Alias opcional bajo /api (útil si FE lo espera así)
+@bp.route("/api/frontend_settings", methods=["GET"])
+def get_frontend_settings_api():
+    return get_frontend_settings()
+
+
+# Endpoints /api esperados pero aún no implementados (evita 404)
+@bp.route("/api/chat", methods=["POST"])
+async def api_chat_placeholder():
+    return jsonify({"message": "chat endpoint placeholder"}), 501
+
+@bp.route("/api/messages", methods=["POST"])
+async def api_messages_placeholder():
+    return jsonify({"message": "messages endpoint placeholder"}), 501
+
+@bp.route("/api/ask", methods=["POST"])
+async def api_ask_placeholder():
+    return jsonify({"message": "ask endpoint placeholder"}), 501
 
 
 # ---------------------------------------------------------------------
