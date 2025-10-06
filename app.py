@@ -1,3 +1,21 @@
+# app.py
+"""
+Aplicación Quart para InviktaChatDemo — endurecida para producción.
+
+Incluye:
+- Redirección HTTP→HTTPS (según X-Forwarded-Proto en Azure) y HSTS.
+- CORS restringido a PUBLIC_SITE_URL.
+- Protección opcional por API key (X-API-Key) en /api/* excepto /health y /status.
+- Headers de seguridad.
+- Endpoints legacy (/api/messages, /api/ask) como alias o 404 según LEGACY_API_ALIAS.
+
+Requiere configurar en Azure App Service:
+- HTTPS Only = On, Minimum TLS = 1.2  (Portal)
+- PUBLIC_SITE_URL = https://tu-frontend.tld
+- (Opcional) API_KEY = <clave segura>
+- (Opcional) LEGACY_API_ALIAS = true  (si quieres alias en /api/messages y /api/ask)
+"""
+
 import copy
 import json
 import os
@@ -5,6 +23,7 @@ import logging
 import uuid
 import httpx
 import asyncio
+
 from quart import (
     Blueprint,
     Quart,
@@ -12,28 +31,35 @@ from quart import (
     make_response,
     request,
     send_from_directory,
-    render_template,
+    render_template,   # si usas plantillas
     current_app,
 )
 
-# CORS opcional: si no tienes quart-cors instalado, no pasa nada
+# CORS (opcional en producción, aquí restringido por dominio)
 try:
-    from quart_cors import cors
+    from quart_cors import cors  # pip install quart-cors
 except ImportError:
     cors = None
 
+# === Azure / OpenAI / Identidad ===
 from openai import AsyncAzureOpenAI
-from azure.identity.aio import (
-    DefaultAzureCredential,
-    get_bearer_token_provider
-)
+from azure.identity.aio import DefaultAzureCredential, get_bearer_token_provider
 
+# === Blueprints propios ===
+from backend.routes.health import health_bp   # /health, /status y /api/*
+from backend.routes.api import bp             # Blueprint principal de /api (tu lógica)
+
+# === Seguridad / Auth / Defender ===
 from backend.auth.auth_utils import get_authenticated_user_details
 from backend.security.ms_defender_utils import get_msdefender_user_json
+
+# === Historial / CosmosDB ===
 from backend.history.cosmosdbservice import CosmosConversationClient
+
+# === Settings y utilidades ===
 from backend.settings import (
     app_settings,
-    MINIMUM_SUPPORTED_AZURE_OPENAI_PREVIEW_API_VERSION
+    MINIMUM_SUPPORTED_AZURE_OPENAI_PREVIEW_API_VERSION,
 )
 from backend.utils import (
     format_as_ndjson,
@@ -44,78 +70,28 @@ from backend.utils import (
 )
 
 # ---------------------------------------------------------------------
-# App / Blueprints
+# Señales / Globals
 # ---------------------------------------------------------------------
-bp = Blueprint("routes", __name__, static_folder="static", template_folder="static")
+
 cosmos_db_ready = asyncio.Event()
-
-
-def create_app():
-    app = Quart(__name__)
-    # CORS básico para pruebas (restringe luego a tu dominio)
-    if cors:
-        app = cors(app, allow_origin="*")
-
-    app.register_blueprint(bp)
-    app.config["TEMPLATES_AUTO_RELOAD"] = True
-
-    @app.before_serving
-    async def init():
-        try:
-            app.cosmos_conversation_client = await init_cosmosdb_client()
-            cosmos_db_ready.set()
-        except Exception:
-            logging.exception("Failed to initialize CosmosDB client")
-            app.cosmos_conversation_client = None
-            raise
-
-    return app
-
-
-# ---------------------------------------------------------------------
-# Static / UI
-# ---------------------------------------------------------------------
-@bp.route("/")
-async def index():
-    return await render_template(
-        "index.html",
-        title=app_settings.ui.title,
-        favicon=app_settings.ui.favicon
-    )
-
-
-@bp.route("/favicon.ico")
-async def favicon():
-    return await bp.send_static_file("favicon.ico")
-
-
-@bp.route("/assets/<path:path>")
-async def assets(path):
-    return await send_from_directory("static/assets", path)
-
-
-# ---------------------------------------------------------------------
-# Logging / Debug
-# ---------------------------------------------------------------------
 DEBUG = os.environ.get("DEBUG", "false").lower() == "true"
 logging.basicConfig(level=logging.DEBUG if DEBUG else logging.INFO)
 
-USER_AGENT = "GitHubSampleWebApp/AsyncAzureOpenAI/1.0.0"
+USER_AGENT = "InviktaChatDemo/AsyncAzureOpenAI/1.0.0"
+MS_DEFENDER_ENABLED = os.environ.get("MS_DEFENDER_ENABLED", "true").lower() == "true"
 
-# Ruta de depuración: lista las rutas disponibles
-@bp.route("/__routes")
-async def list_routes():
-    routes = []
-    # Nota: app es el objeto global creado al final del archivo
-    for rule in app.url_map.iter_rules():
-        methods = sorted(m for m in rule.methods if m not in ("HEAD", "OPTIONS"))
-        routes.append({"rule": str(rule), "methods": methods})
-    return jsonify(routes), 200
+azure_openai_tools = []
+azure_openai_available_tools = []
 
+# Seguridad / configuración desde entorno (sin secretos hardcodeados)
+PUBLIC_SITE_URL = os.getenv("PUBLIC_SITE_URL", "").strip()
+REQUIRED_API_KEY = os.getenv("API_KEY", "").strip()
+LEGACY_API_ALIAS = os.getenv("LEGACY_API_ALIAS", "false").lower() == "true"
 
 # ---------------------------------------------------------------------
-# Frontend settings (expuestos al FE)
+# Ajustes frontend (opcional)
 # ---------------------------------------------------------------------
+
 frontend_settings = {
     "auth_enabled": app_settings.base_settings.auth_enabled,
     "feedback_enabled": (
@@ -134,20 +110,128 @@ frontend_settings = {
     "oyd_enabled": app_settings.base_settings.datasource_type,
 }
 
-# Defender
-MS_DEFENDER_ENABLED = os.environ.get("MS_DEFENDER_ENABLED", "true").lower() == "true"
+# ---------------------------------------------------------------------
+# Factory de aplicación
+# ---------------------------------------------------------------------
 
-# Herramientas para Function Calling remoto
-azure_openai_tools = []
-azure_openai_available_tools = []
+def create_app() -> Quart:
+    """
+    Crea la aplicación Quart, aplica CORS con dominio permitido y registra blueprints.
+    """
+    app = Quart(__name__)
 
+    # CORS restringido a PUBLIC_SITE_URL (si está definido e instalado quart-cors)
+    if cors and PUBLIC_SITE_URL:
+        app = cors(app, allow_origin=[PUBLIC_SITE_URL])
+    elif cors:
+        # Sin origen definido, no abrimos CORS (mejor que "*")
+        logging.warning("PUBLIC_SITE_URL vacío: CORS no habilitado.")
+
+    # 1) Endpoints de salud: /health, /status y /api/*
+    app.register_blueprint(health_bp)
+
+    # 2) Resto de la app: API pública, estáticos, etc.
+    app.register_blueprint(bp)
+    app.config["TEMPLATES_AUTO_RELOAD"] = True
+
+    # --- Seguridad: redirección HTTPS y headers duros ---
+    @app.before_request
+    async def _enforce_https():
+        # En Azure, la app está detrás de proxy; usa X-Forwarded-Proto
+        xf_proto = request.headers.get("X-Forwarded-Proto", "").lower()
+        # Redirige solo si viene por http (evita bucles)
+        if xf_proto and xf_proto != "https":
+            url = request.url.replace("http://", "https://", 1)
+            return make_response(("", 308, {"Location": url}))
+
+    @app.after_request
+    async def _security_headers(resp):
+        # HSTS (1 año, incluye subdominios)
+        resp.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+        # Endurece respuestas
+        resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+        resp.headers.setdefault("X-Frame-Options", "DENY")
+        resp.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+        resp.headers.setdefault("X-XSS-Protection", "0")  # moderno; evita heurísticos antiguos
+        # Oculta el servidor si Uvicorn lo añade
+        resp.headers.pop("Server", None)
+        return resp
+
+    # --- Guardia por API key en /api/* (excepto salud) ---
+    @app.before_request
+    async def _guard_api_key():
+        """
+        Si defines API_KEY, exige X-API-Key en las rutas /api/*
+        exceptuando /api/health y /api/status (útiles para probes).
+        Si no hay API_KEY, no bloquea (útil en dev).
+        Si EasyAuth está activo (usuario autenticado), se permite sin API key.
+        """
+        if not REQUIRED_API_KEY:
+            return  # sin clave → no bloquea
+
+        path = request.path or ""
+        exempt = {"/api/health", "/api/status", "/health", "/status"}
+        if not path.startswith("/api/") or path in exempt:
+            return
+
+        # Si EasyAuth entrega identidad, permitimos paso
+        try:
+            user = get_authenticated_user_details(request_headers=request.headers)
+            if user and user.get("user_principal_id"):
+                return
+        except Exception:
+            pass
+
+        provided = request.headers.get("X-API-Key") or request.args.get("api_key")
+        if provided != REQUIRED_API_KEY:
+            return jsonify({"error": "unauthorized"}), 401
+
+    @app.before_serving
+    async def init():
+        """
+        Hook de arranque:
+        - Inicializa CosmosDB si está configurado.
+        """
+        try:
+            app.cosmos_conversation_client = await init_cosmosdb_client()
+            cosmos_db_ready.set()
+        except Exception:
+            logging.exception("Failed to initialize CosmosDB client")
+            app.cosmos_conversation_client = None
+            raise
+
+    return app
 
 # ---------------------------------------------------------------------
-# Azure OpenAI client
+# Estáticos y utilidades de depuración
 # ---------------------------------------------------------------------
-async def init_openai_client():
+
+@bp.route("/")
+async def index():
+    return jsonify({"ok": True, "app": "InviktaChatDemo", "status": "running"}), 200
+
+@bp.route("/favicon.ico")
+async def favicon():
+    return await bp.send_static_file("favicon.ico")
+
+@bp.route("/assets/<path:path>")
+async def assets(path: str):
+    return await send_from_directory("static/assets", path)
+
+@bp.route("/__routes")
+async def list_routes():
+    routes = []
+    for rule in current_app.url_map.iter_rules():
+        methods = sorted(m for m in rule.methods if m not in ("HEAD", "OPTIONS"))
+        routes.append({"rule": str(rule), "methods": methods})
+    return jsonify(routes), 200
+
+# ---------------------------------------------------------------------
+# Inicialización de Azure OpenAI
+# ---------------------------------------------------------------------
+
+async def init_openai_client() -> AsyncAzureOpenAI:
     try:
-        # Versión API mínima (preview)
         if (
             app_settings.azure_openai.preview_api_version
             < MINIMUM_SUPPORTED_AZURE_OPENAI_PREVIEW_API_VERSION
@@ -157,11 +241,7 @@ async def init_openai_client():
                 f"'{MINIMUM_SUPPORTED_AZURE_OPENAI_PREVIEW_API_VERSION}'"
             )
 
-        # Endpoint (acepta AZURE_OPENAI_ENDPOINT o AZURE_OPENAI_RESOURCE)
-        if (
-            not app_settings.azure_openai.endpoint and
-            not app_settings.azure_openai.resource
-        ):
+        if not app_settings.azure_openai.endpoint and not app_settings.azure_openai.resource:
             raise ValueError("AZURE_OPENAI_ENDPOINT or AZURE_OPENAI_RESOURCE is required")
 
         endpoint = (
@@ -170,41 +250,31 @@ async def init_openai_client():
             else f"https://{app_settings.azure_openai.resource}.openai.azure.com/"
         )
 
-        # Auth (API Key o Entra ID)
         aoai_api_key = app_settings.azure_openai.key
         ad_token_provider = None
         if not aoai_api_key:
             logging.debug("No AZURE_OPENAI_KEY found, using Azure Entra ID auth")
             async with DefaultAzureCredential() as credential:
                 ad_token_provider = get_bearer_token_provider(
-                    credential,
-                    "https://cognitiveservices.azure.com/.default"
+                    credential, "https://cognitiveservices.azure.com/.default"
                 )
 
-        # Deployment (nombre del deployment, no del modelo)
         deployment = app_settings.azure_openai.model
         if not deployment:
             raise ValueError("AZURE_OPENAI_MODEL is required")
 
-        # Headers
         default_headers = {"x-ms-useragent": USER_AGENT}
 
-        # Descarga de metadatos de tools (si procede)
         if app_settings.azure_openai.function_call_azure_functions_enabled:
             tools_base_url = getattr(
-                app_settings.azure_openai,
-                "function_call_azure_functions_tools_base_url",
-                None
+                app_settings.azure_openai, "function_call_azure_functions_tools_base_url", None
             )
             tools_key = getattr(
-                app_settings.azure_openai,
-                "function_call_azure_functions_tools_key",
-                None
+                app_settings.azure_openai, "function_call_azure_functions_tools_key", None
             )
             if tools_base_url and tools_key:
-                url = f"{tools_base_url}?code={tools_key}"
                 async with httpx.AsyncClient() as client:
-                    r = await client.get(url)
+                    r = await client.get(f"{tools_base_url}?code={tools_key}")
                 if r.status_code == httpx.codes.OK:
                     azure_openai_tools.extend(json.loads(r.text))
                     for tool in azure_openai_tools:
@@ -215,7 +285,6 @@ async def init_openai_client():
                         r.status_code
                     )
 
-        # Cliente
         return AsyncAzureOpenAI(
             api_version=app_settings.azure_openai.preview_api_version,
             api_key=aoai_api_key,
@@ -223,35 +292,26 @@ async def init_openai_client():
             default_headers=default_headers,
             azure_endpoint=endpoint,
         )
+
     except Exception:
         logging.exception("Exception in Azure OpenAI initialization")
         raise
 
+# ---------------------------------------------------------------------
+# Function Calling vía Azure Functions (invocación remota)
+# ---------------------------------------------------------------------
 
-# ---------------------------------------------------------------------
-# Llamada remota a Azure Functions para Function Calling
-# ---------------------------------------------------------------------
-async def openai_remote_azure_function_call(function_name, function_args):
+async def openai_remote_azure_function_call(function_name: str, function_args: str):
     if app_settings.azure_openai.function_call_azure_functions_enabled is not True:
         return
 
-    base_url = getattr(
-        app_settings.azure_openai,
-        "function_call_azure_functions_tool_base_url",
-        None
-    ) or getattr(
-        app_settings.azure_openai,
-        "function_call_azure_functions_tools_base_url",
-        None
+    base_url = (
+        getattr(app_settings.azure_openai, "function_call_azure_functions_tool_base_url", None)
+        or getattr(app_settings.azure_openai, "function_call_azure_functions_tools_base_url", None)
     )
-    key = getattr(
-        app_settings.azure_openai,
-        "function_call_azure_functions_tool_key",
-        None
-    ) or getattr(
-        app_settings.azure_openai,
-        "function_call_azure_functions_tools_key",
-        None
+    key = (
+        getattr(app_settings.azure_openai, "function_call_azure_functions_tool_key", None)
+        or getattr(app_settings.azure_openai, "function_call_azure_functions_tools_key", None)
     )
 
     if not base_url or not key:
@@ -267,17 +327,15 @@ async def openai_remote_azure_function_call(function_name, function_args):
     resp.raise_for_status()
     return resp.text
 
+# ---------------------------------------------------------------------
+# Cosmos DB (historial)
+# ---------------------------------------------------------------------
 
-# ---------------------------------------------------------------------
-# Cosmos DB (historial de conversación)
-# ---------------------------------------------------------------------
 async def init_cosmosdb_client():
     cosmos_conversation_client = None
     if app_settings.chat_history:
         try:
-            cosmos_endpoint = (
-                f"https://{app_settings.chat_history.account}.documents.azure.com:443/"
-            )
+            cosmos_endpoint = f"https://{app_settings.chat_history.account}.documents.azure.com:443/"
 
             if not app_settings.chat_history.account_key:
                 async with DefaultAzureCredential() as cred:
@@ -301,20 +359,16 @@ async def init_cosmosdb_client():
 
     return cosmos_conversation_client
 
-
 # ---------------------------------------------------------------------
 # Preparación de payload para Chat Completions
 # ---------------------------------------------------------------------
-def prepare_model_args(request_body, request_headers):
+
+def prepare_model_args(request_body: dict, request_headers) -> dict:
     request_messages = request_body.get("messages", [])
     messages = []
+
     if not app_settings.datasource:
-        messages = [
-            {
-                "role": "system",
-                "content": app_settings.azure_openai.system_message
-            }
-        ]
+        messages = [{"role": "system", "content": app_settings.azure_openai.system_message}]
 
     for message in request_messages:
         if not message:
@@ -350,7 +404,7 @@ def prepare_model_args(request_body, request_headers):
         "top_p": app_settings.azure_openai.top_p,
         "stop": app_settings.azure_openai.stop_sequence,
         "stream": app_settings.azure_openai.stream,
-        "model": app_settings.azure_openai.model,  # deployment name
+        "model": app_settings.azure_openai.model,  # deployment
     }
 
     if messages and messages[-1]["role"] == "user":
@@ -360,22 +414,13 @@ def prepare_model_args(request_body, request_headers):
         if app_settings.datasource:
             model_args["extra_body"] = {
                 "data_sources": [
-                    app_settings.datasource.construct_payload_configuration(
-                        request=request
-                    )
+                    app_settings.datasource.construct_payload_configuration(request=request)
                 ]
             }
 
-    # Copia "limpia" para logs (sin secretos)
     model_args_clean = copy.deepcopy(model_args)
     if model_args_clean.get("extra_body"):
-        secret_params = [
-            "key",
-            "connection_string",
-            "embedding_key",
-            "encoded_api_key",
-            "api_key",
-        ]
+        secret_params = ["key", "connection_string", "embedding_key", "encoded_api_key", "api_key"]
         params = model_args_clean["extra_body"]["data_sources"][0]["parameters"]
         for s in secret_params:
             if params.get(s):
@@ -400,11 +445,11 @@ def prepare_model_args(request_body, request_headers):
     logging.debug("REQUEST BODY: %s", json.dumps(model_args_clean, indent=4))
     return model_args
 
-
 # ---------------------------------------------------------------------
 # Promptflow (opcional)
 # ---------------------------------------------------------------------
-async def promptflow_request(req):
+
+async def promptflow_request(req: dict) -> dict:
     try:
         headers = {
             "Content-Type": "application/json",
@@ -431,10 +476,24 @@ async def promptflow_request(req):
     except Exception as e:
         logging.error("An error occurred while making promptflow_request: %s", e)
 
+# ---------------------------------------------------------------------
+# Llamada a AOAI (no streaming) y orquestación de tool calls
+# ---------------------------------------------------------------------
 
-# ---------------------------------------------------------------------
-# Function calling (no streaming)
-# ---------------------------------------------------------------------
+async def send_chat_request(request_body: dict, request_headers):
+    request_body["messages"] = [m for m in request_body.get("messages", []) if m.get("role") != "tool"]
+    model_args = prepare_model_args(request_body, request_headers)
+
+    try:
+        azure_openai_client = await init_openai_client()
+        raw = await azure_openai_client.chat.completions.with_raw_response.create(**model_args)
+        response = raw.parse()
+        apim_request_id = raw.headers.get("apim-request-id")
+        return response, apim_request_id
+    except Exception:
+        logging.exception("Exception in send_chat_request")
+        raise
+
 async def process_function_call(response):
     response_message = response.choices[0].message
     messages = []
@@ -448,51 +507,27 @@ async def process_function_call(response):
                 tool_call.function.name, tool_call.function.arguments
             )
 
-            messages.append(
-                {
-                    "role": response_message.role,
-                    "function_call": {
-                        "name": tool_call.function.name,
-                        "arguments": tool_call.function.arguments,
-                    },
-                    "content": None,
-                }
-            )
-            messages.append(
-                {
-                    "role": "function",
+            messages.append({
+                "role": response_message.role,
+                "function_call": {
                     "name": tool_call.function.name,
-                    "content": function_response,
-                }
-            )
+                    "arguments": tool_call.function.arguments,
+                },
+                "content": None,
+            })
+            messages.append({
+                "role": "function",
+                "name": tool_call.function.name,
+                "content": function_response,
+            })
         return messages
     return None
 
-
 # ---------------------------------------------------------------------
-# Chat: envío base
+# Chat completo (no streaming)
 # ---------------------------------------------------------------------
-async def send_chat_request(request_body, request_headers):
-    request_body["messages"] = [
-        m for m in request_body.get("messages", []) if m.get("role") != "tool"
-    ]
-    model_args = prepare_model_args(request_body, request_headers)
 
-    try:
-        azure_openai_client = await init_openai_client()
-        raw = await azure_openai_client.chat.completions.with_raw_response.create(**model_args)
-        response = raw.parse()
-        apim_request_id = raw.headers.get("apim-request-id")
-        return response, apim_request_id
-    except Exception:
-        logging.exception("Exception in send_chat_request")
-        raise
-
-
-# ---------------------------------------------------------------------
-# Chat: completo (no streaming)
-# ---------------------------------------------------------------------
-async def complete_chat_request(request_body, request_headers):
+async def complete_chat_request(request_body: dict, request_headers):
     if app_settings.base_settings.use_promptflow:
         response = await promptflow_request(request_body)
         history_metadata = request_body.get("history_metadata", {})
@@ -517,10 +552,10 @@ async def complete_chat_request(request_body, request_headers):
 
     return non_streaming_response
 
+# ---------------------------------------------------------------------
+# Streaming (incluye Function Calling durante stream)
+# ---------------------------------------------------------------------
 
-# ---------------------------------------------------------------------
-# Function calling (streaming)
-# ---------------------------------------------------------------------
 class AzureOpenaiFunctionCallStreamState:
     def __init__(self):
         self.tool_calls = []
@@ -530,8 +565,8 @@ class AzureOpenaiFunctionCallStreamState:
         self.function_messages = []
         self.streaming_state = "INITIAL"  # INITIAL, STREAMING, COMPLETED
 
-
-async def process_function_call_stream(completionChunk, state, request_body, request_headers, history_metadata, apim_request_id):
+async def process_function_call_stream(completionChunk, state: AzureOpenaiFunctionCallStreamState,
+                                       request_body, request_headers, history_metadata, apim_request_id):
     if not (hasattr(completionChunk, "choices") and completionChunk.choices):
         return state.streaming_state
 
@@ -582,8 +617,7 @@ async def process_function_call_stream(completionChunk, state, request_body, req
 
     return state.streaming_state
 
-
-async def stream_chat_request(request_body, request_headers):
+async def stream_chat_request(request_body: dict, request_headers):
     response, apim_request_id = await send_chat_request(request_body, request_headers)
     history_metadata = request_body.get("history_metadata", {})
 
@@ -609,11 +643,11 @@ async def stream_chat_request(request_body, request_headers):
 
     return generate(apim_request_id=apim_request_id, history_metadata=history_metadata)
 
+# ---------------------------------------------------------------------
+# Orquestación de conversación (elige streaming o no)
+# ---------------------------------------------------------------------
 
-# ---------------------------------------------------------------------
-# Orquestación de conversación (streaming o no)
-# ---------------------------------------------------------------------
-async def conversation_internal(request_body, request_headers):
+async def conversation_internal(request_body: dict, request_headers):
     try:
         if app_settings.azure_openai.stream and not app_settings.base_settings.use_promptflow:
             gen = await stream_chat_request(request_body, request_headers)
@@ -629,30 +663,10 @@ async def conversation_internal(request_body, request_headers):
         status = getattr(ex, "status_code", 500)
         return jsonify({"error": str(ex)}), status
 
-
 # ---------------------------------------------------------------------
-# Rutas HTTP
+# Rutas HTTP (API pública)
 # ---------------------------------------------------------------------
-# Health/Status (root)
-@bp.route("/health", methods=["GET"])
-async def health_root():
-    return jsonify({"status": "ok", "scope": "root"}), 200
 
-@bp.route("/status", methods=["GET"])
-async def status_root():
-    return jsonify({"app": "InviktaChatDemo", "scope": "root"}), 200
-
-# Health/Status (api)
-@bp.route("/api/health", methods=["GET"])
-async def health_api():
-    return jsonify({"status": "ok", "scope": "api"}), 200
-
-@bp.route("/api/status", methods=["GET"])
-async def status_api():
-    return jsonify({"app": "InviktaChatDemo", "scope": "api"}), 200
-
-
-# Conversación (ruta original)
 @bp.route("/conversation", methods=["POST"])
 async def conversation():
     if not request.is_json:
@@ -660,43 +674,71 @@ async def conversation():
     request_json = await request.get_json()
     return await conversation_internal(request_json, request.headers)
 
-# Conversación (alias bajo /api)
 @bp.route("/api/conversation", methods=["POST"])
 async def conversation_api():
     return await conversation()
 
-
 @bp.route("/frontend_settings", methods=["GET"])
-def get_frontend_settings():
+async def get_frontend_settings():
     try:
         return jsonify(frontend_settings), 200
     except Exception:
         logging.exception("Exception in /frontend_settings")
         return jsonify({"error": "internal error"}), 500
 
-# Alias opcional bajo /api (útil si FE lo espera así)
 @bp.route("/api/frontend_settings", methods=["GET"])
-def get_frontend_settings_api():
-    return get_frontend_settings()
+async def get_frontend_settings_api():
+    return await get_frontend_settings()
 
+# --- Helper común para /api/chat y (si alias) /api/messages, /api/ask ---
+async def _normalize_and_dispatch(req_json, headers):
+    if "messages" not in req_json or not isinstance(req_json.get("messages"), list):
+        user_text = (
+            req_json.get("input")
+            or req_json.get("question")
+            or req_json.get("prompt")
+            or req_json.get("query")
+        )
+        if not user_text:
+            return jsonify({"error": "missing 'messages' or 'input/question/prompt'"}), 400
+        req_json["messages"] = [{"role": "user", "content": user_text}]
+    return await conversation_internal(req_json, headers)
 
-# Endpoints /api esperados pero aún no implementados (evita 404)
 @bp.route("/api/chat", methods=["POST"])
-async def api_chat_placeholder():
-    return jsonify({"message": "chat endpoint placeholder"}), 501
+async def api_chat():
+    if not request.is_json:
+        return jsonify({"error": "request must be json"}), 415
+    req = await request.get_json()
+    return await _normalize_and_dispatch(req, request.headers)
 
-@bp.route("/api/messages", methods=["POST"])
-async def api_messages_placeholder():
-    return jsonify({"message": "messages endpoint placeholder"}), 501
+# --- Endpoints legacy: alias o 404 según LEGACY_API_ALIAS ---
+if LEGACY_API_ALIAS:
+    @bp.route("/api/messages", methods=["POST"])
+    async def api_messages():
+        if not request.is_json:
+            return jsonify({"error": "request must be json"}), 415
+        req = await request.get_json()
+        return await _normalize_and_dispatch(req, request.headers)
 
-@bp.route("/api/ask", methods=["POST"])
-async def api_ask_placeholder():
-    return jsonify({"message": "ask endpoint placeholder"}), 501
+    @bp.route("/api/ask", methods=["POST"])
+    async def api_ask():
+        if not request.is_json:
+            return jsonify({"error": "request must be json"}), 415
+        req = await request.get_json()
+        return await _normalize_and_dispatch(req, request.headers)
+else:
+    @bp.route("/api/messages", methods=["POST", "GET", "OPTIONS"])
+    async def api_messages_404():
+        return jsonify({"error": "not found"}), 404
 
+    @bp.route("/api/ask", methods=["POST", "GET", "OPTIONS"])
+    async def api_ask_404():
+        return jsonify({"error": "not found"}), 404
 
 # ---------------------------------------------------------------------
-# API de historial (Cosmos)
+# API de Historial (CosmosDB) — sin cambios funcionales
 # ---------------------------------------------------------------------
+
 @bp.route("/history/generate", methods=["POST"])
 async def add_conversation():
     await cosmos_db_ready.wait()
@@ -731,9 +773,7 @@ async def add_conversation():
             input_message=messages[-1],
         )
         if createdMessageValue == "Conversation not found":
-            raise Exception(
-                "Conversation not found for the given conversation ID: " + conversation_id + "."
-            )
+            raise Exception("Conversation not found for the given conversation ID: " + conversation_id + ".")
 
         request_body = await request.get_json()
         history_metadata["conversation_id"] = conversation_id
@@ -743,7 +783,6 @@ async def add_conversation():
     except Exception:
         logging.exception("Exception in /history/generate")
         return jsonify({"error": "internal error"}), 500
-
 
 @bp.route("/history/update", methods=["POST"])
 async def update_conversation():
@@ -757,7 +796,6 @@ async def update_conversation():
     try:
         if not current_app.cosmos_conversation_client:
             raise Exception("CosmosDB is not configured or not working")
-
         if not conversation_id:
             raise Exception("No conversation_id found")
 
@@ -785,7 +823,6 @@ async def update_conversation():
     except Exception:
         logging.exception("Exception in /history/update")
         return jsonify({"error": "internal error"}), 500
-
 
 @bp.route("/history/message_feedback", methods=["POST"])
 async def update_message():
@@ -820,7 +857,6 @@ async def update_message():
         logging.exception("Exception in /history/message_feedback")
         return jsonify({"error": "internal error"}), 500
 
-
 @bp.route("/history/delete", methods=["DELETE"])
 async def delete_conversation():
     await cosmos_db_ready.wait()
@@ -848,7 +884,6 @@ async def delete_conversation():
         logging.exception("Exception in /history/delete")
         return jsonify({"error": "internal error"}), 500
 
-
 @bp.route("/history/list", methods=["GET"])
 async def list_conversations():
     await cosmos_db_ready.wait()
@@ -866,7 +901,6 @@ async def list_conversations():
         return jsonify({"error": f"No conversations for {user_id} were found"}), 404
 
     return jsonify(conversations), 200
-
 
 @bp.route("/history/read", methods=["POST"])
 async def get_conversation():
@@ -901,7 +935,6 @@ async def get_conversation():
     ]
     return jsonify({"conversation_id": conversation_id, "messages": messages}), 200
 
-
 @bp.route("/history/rename", methods=["POST"])
 async def rename_conversation():
     await cosmos_db_ready.wait()
@@ -930,7 +963,6 @@ async def rename_conversation():
     updated = await current_app.cosmos_conversation_client.upsert_conversation(conversation)
     return jsonify(updated), 200
 
-
 @bp.route("/history/delete_all", methods=["DELETE"])
 async def delete_all_conversations():
     await cosmos_db_ready.wait()
@@ -957,7 +989,6 @@ async def delete_all_conversations():
         logging.exception("Exception in /history/delete_all")
         return jsonify({"error": "internal error"}), 500
 
-
 @bp.route("/history/clear", methods=["POST"])
 async def clear_messages():
     await cosmos_db_ready.wait()
@@ -981,7 +1012,6 @@ async def clear_messages():
     except Exception:
         logging.exception("Exception in /history/clear_messages")
         return jsonify({"error": "internal error"}), 500
-
 
 @bp.route("/history/ensure", methods=["GET"])
 async def ensure_cosmos():
@@ -1010,10 +1040,10 @@ async def ensure_cosmos():
         else:
             return jsonify({"error": "CosmosDB is not working"}), 500
 
+# ---------------------------------------------------------------------
+# Generación de título (historial)
+# ---------------------------------------------------------------------
 
-# ---------------------------------------------------------------------
-# Título automático para historial
-# ---------------------------------------------------------------------
 async def generate_title(conversation_messages) -> str:
     title_prompt = (
         "Summarize the conversation so far into a 4-word or less title. "
@@ -1037,8 +1067,12 @@ async def generate_title(conversation_messages) -> str:
         logging.exception("Exception while generating title")
         return messages[-2]["content"]
 
+# ---------------------------------------------------------------------
+# Entry point (ASGI/WSGI)
+# ---------------------------------------------------------------------
 
-# ---------------------------------------------------------------------
-# WSGI/ASGI entrypoint
-# ---------------------------------------------------------------------
 app = create_app()
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", "8000"))
+    app.run(host="0.0.0.0", port=port)
